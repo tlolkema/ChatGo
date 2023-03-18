@@ -1,123 +1,112 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"net/http"
-	"os"
+	"log"
 	"strings"
+
+	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	req "example.com/chatgo/request"
 )
 
-type InputBody struct {
-	Model    string `json:"model"`
-	Messages []struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	} `json:"messages"`
-}
-
-type ChatResponse struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	Choices []struct {
-		Index        int `json:"index"`
-		Message      Message
-		FinishReason string `json:"finish_reason"`
-	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
-}
-
-type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type Messages []struct {
-	Message
-}
-
-func init() {
-	if os.Getenv("OPENAI_API_KEY") == "" {
-		fmt.Println("OPENAI_API_KEY is not set")
-		os.Exit(1)
-	}
-}
-
-func getPrompt() string {
-	fmt.Print("Chat: ")
-	reader := bufio.NewReader(os.Stdin)
-	input, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Println("An error occured while reading input. Please try again", err)
-	}
-	return strings.TrimSuffix(input, "\n")
-}
-
 func main() {
+	p := tea.NewProgram(initialModel())
 
-	input := getPrompt()
+	if _, err := p.Run(); err != nil {
+		log.Fatal(err)
+	}
+}
 
-	url := "https://api.openai.com/v1/chat/completions"
+type (
+	errMsg error
+)
 
-	body := InputBody{
-		Model: "gpt-3.5-turbo",
-		Messages: []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		}{
-			{Role: "user", Content: input},
-		},
+type model struct {
+	viewport    viewport.Model
+	messages    []string
+	textarea    textarea.Model
+	senderStyle lipgloss.Style
+	err         error
+	spinner     spinner.Model
+}
+
+func initialModel() model {
+	ta := textarea.New()
+	ta.Placeholder = "Send a message..."
+	ta.Focus()
+
+	ta.Prompt = "┃ "
+	ta.CharLimit = 600
+
+	ta.SetWidth(80)
+	ta.SetHeight(3)
+
+	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
+
+	ta.ShowLineNumbers = false
+
+	vp := viewport.New(80, 20)
+	vp.Style.MaxWidth(10)
+	vp.SetContent(`ChatGO, press Enter to send.`)
+
+	ta.KeyMap.InsertNewline.SetEnabled(false)
+
+	return model{
+		textarea:    ta,
+		messages:    []string{},
+		viewport:    vp,
+		senderStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("5")),
+		err:         nil,
+	}
+}
+
+func (m model) Init() tea.Cmd {
+	return textarea.Blink
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var (
+		tiCmd tea.Cmd
+		vpCmd tea.Cmd
+	)
+
+	m.textarea, tiCmd = m.textarea.Update(msg)
+	m.viewport, vpCmd = m.viewport.Update(msg)
+
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyCtrlC, tea.KeyEsc:
+			fmt.Println(m.textarea.Value())
+			return m, tea.Quit
+		case tea.KeyEnter:
+			m.messages = append(m.messages, m.senderStyle.Render("You: ")+m.textarea.Value())
+			response := req.MakeRequest(m.messages)
+			m.messages = append(m.messages, m.senderStyle.Render()+response)
+
+			m.viewport.SetContent(strings.Join(m.messages, "\n"))
+
+			m.textarea.Reset()
+			m.viewport.GotoBottom()
+		}
+
+	case errMsg:
+		m.err = msg
+		return m, nil
 	}
 
-	jsonBody, err := json.Marshal(body)
-	if err != nil {
-		fmt.Println("Error encoding request body:", err)
-		return
-	}
+	return m, tea.Batch(tiCmd, vpCmd)
+}
 
-	headers := map[string]string{
-		"Content-Type":  "application/json",
-		"Authorization": "Bearer " + os.Getenv("OPENAI_API_KEY"),
-	}
-
-	client := &http.Client{}
-	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return
-	}
-
-	for key, value := range headers {
-		req.Header.Add(key, value)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Error making request:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response body:", err)
-		return
-	}
-
-	var chatResponse ChatResponse
-	err = json.Unmarshal(respBody, &chatResponse)
-	if err != nil {
-		fmt.Println("Error decoding response body:", err)
-		return
-	}
-
-	fmt.Println(chatResponse.Choices[0].Message.Content)
+func (m model) View() string {
+	return fmt.Sprintf(
+		"%s\n\n%s",
+		m.viewport.View(),
+		m.textarea.View(),
+	) + "\n\n(esc to quit) (cmd + c to copy)"
 }
